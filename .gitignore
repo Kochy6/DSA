@@ -1,0 +1,4 @@
+data/
+*.dcm
+*.pth
+__pycache__/
