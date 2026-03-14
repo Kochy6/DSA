@@ -12,7 +12,7 @@ from monai.transforms import (
 )
 
 class DSADataset(Dataset):
-    def __init__(self, csv_path, target_frames=32, spatial_size=(512, 512)):
+    def __init__(self, csv_path, target_frames=32, spatial_size=(256, 256)):
         """
         Args:
             csv_path: 第一阶段生成的 cleansed_list.csv 路径
