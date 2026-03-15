@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
-from torch.cuda.amp import autocast, GradScaler
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score, accuracy_score
 import torch.optim.lr_scheduler as lr_scheduler
@@ -18,8 +17,8 @@ from model import DSATemporalModel
 # --- 1. 超参数与全局配置 ---
 cfg = {
     "csv_path": r"/mnt/pro/DSA/cleansed_list.csv",
-    "batch_size": 2,          # 物理显存限制
-    "accumulation_steps": 8,  # 梯度累积，等效 Batch Size = 16
+    "batch_size": 4,          # 物理显存限制
+    "accumulation_steps": 8,  # 梯度累积，等效 Batch Size = 32
     "epochs": 50,
     "freeze_epochs": 10,      # 前10轮冻结Backbone
     "lr": 5e-5,
@@ -42,7 +41,7 @@ def seed_everything(seed=42):
 def train_one_epoch(model, loader, optimizer, criterion, device, epoch, scaler):
     model.train()
     running_loss = 0.0
-    total_preds = []
+    total_probs = []  # 【修改】改为收集概率值而不是硬标签 (0/1)
     total_labels = []
     
     os.makedirs('debug_images', exist_ok=True)
@@ -79,9 +78,10 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch, scaler):
 
         running_loss += loss.item() * cfg["accumulation_steps"] * images.size(0)
         
+        # 【修改】获取类别1的预测概率，用于计算 Train AUC
         with torch.no_grad():
-            _, predicted = torch.max(outputs, 1)
-            total_preds.extend(predicted.cpu().numpy())
+            probs = torch.softmax(outputs, dim=1)[:, 1]
+            total_probs.extend(probs.cpu().numpy())
             total_labels.extend(labels.cpu().numpy())
 
     # 处理剩余梯度
@@ -91,7 +91,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch, scaler):
         optimizer.zero_grad()
 
     epoch_loss = running_loss / len(loader.dataset)
-    return epoch_loss, np.array(total_preds), np.array(total_labels)
+    return epoch_loss, np.array(total_probs), np.array(total_labels)
 
 # --- 3. 验证逻辑 ---
 def validate(model, loader, criterion, device):
@@ -121,10 +121,10 @@ def main():
     seed_everything(42)
     os.makedirs(cfg["save_dir"], exist_ok=True)
     
-    # 【新增】定义日志文件路径
-    log_path = os.path.join(cfg["save_dir"], "training_results.txt")
+    # 定义日志文件路径
+    log_path = os.path.join(cfg["save_dir"], "training_results_batchsize_4.txt")
     
-    # 【新增】辅助函数：同时打印到控制台和写入文件
+    # 辅助函数：同时打印到控制台和写入文件
     def log(message):
         print(message)
         with open(log_path, "a") as f:
@@ -135,25 +135,22 @@ def main():
         f.write("=== Training Log ===\n")
 
     df = pd.read_csv(cfg["csv_path"])
-    full_dataset = DSADataset(cfg["csv_path"])
-    
     # 计算类别权重 (负样本数 / 正样本数)
     neg_c, pos_c = len(df[df['label']==0]), len(df[df['label']==1])
     class_weights = torch.tensor([1.0, neg_c / pos_c], dtype=torch.float).to(cfg["device"])
-    log(f"[INFO] 权重分配: {class_weights.cpu().numpy()}") # 【修改】使用log
+    log(f"[INFO] 权重分配: {class_weights.cpu().numpy()}") 
 
     skf = StratifiedKFold(n_splits=cfg["num_folds"], shuffle=True, random_state=42)
-    
-    fold_auc_scores = [] # 【新增】记录每折结果
+    fold_auc_scores = [] 
 
     for fold, (train_idx, val_idx) in enumerate(skf.split(df, df['label'])):
-        log(f"\n{'='*10} Fold {fold+1}/{cfg['num_folds']} {'='*10}") # 【修改】使用log
+        log(f"\n{'='*10} Fold {fold+1}/{cfg['num_folds']} {'='*10}") 
         
-        train_loader = DataLoader(Subset(full_dataset, train_idx), batch_size=cfg["batch_size"], 
-                                  shuffle=True, num_workers=4, pin_memory=True, persistent_workers=True)
-        # ...existing code...
-        val_loader = DataLoader(Subset(full_dataset, val_idx), batch_size=cfg["batch_size"], 
-                                num_workers=2, pin_memory=True)
+        train_dataset = DSADataset(cfg["csv_path"], mode='train')
+        val_dataset = DSADataset(cfg["csv_path"], mode='val')
+
+        train_loader = DataLoader(Subset(train_dataset, train_idx), batch_size=cfg["batch_size"], shuffle=True, num_workers=4, pin_memory=True, persistent_workers=True)
+        val_loader = DataLoader(Subset(val_dataset, val_idx), batch_size=cfg["batch_size"], shuffle=False, num_workers=2, pin_memory=True)
         
         model = DSATemporalModel(num_classes=2).to(cfg["device"])
         
@@ -161,10 +158,11 @@ def main():
         for param in model.backbone.parameters():
             param.requires_grad = False
         
+        # 1. 解冻前的优化器 (只练顶层)
         optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=cfg["lr"])
         scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg["epochs"])
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
-        scaler = torch.amp.GradScaler('cuda') # 修正旧版调用方式
+        criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+        scaler = torch.amp.GradScaler('cuda') 
         
         best_auc = 0.0
         
@@ -174,13 +172,25 @@ def main():
                 for param in model.backbone.parameters():
                     param.requires_grad = True
                 torch.cuda.empty_cache()
-                optimizer = optim.AdamW(model.parameters(), lr=cfg["lr"] * 0.2)
+                optimizer = optim.AdamW([
+                {'params': model.backbone.parameters(), 'lr': cfg["lr"] * 0.1}, 
+                {'params': model.transformer.parameters(), 'lr': cfg["lr"]},
+                {'params': model.att_pooling.parameters(), 'lr': cfg["lr"]},
+                {'params': model.classifier.parameters(), 'lr': cfg["lr"]}
+                                        ], weight_decay=0.05) # 显式增加权重衰减
                 scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg["epochs"] - epoch)
-                log(f"[INFO] Epoch {epoch}: Backbone已解冻，开始微调。") # 【修改】使用log
+                log(f"[INFO] Epoch {epoch}: Backbone已解冻，开始微调。") 
 
-            # 调用训练和验证
-            # ...existing code...
-            train_loss, t_preds, t_labels, = train_one_epoch(model, train_loader, optimizer, criterion, cfg["device"], epoch, scaler)
+            # 调用训练
+            train_loss, t_probs, t_labels = train_one_epoch(model, train_loader, optimizer, criterion, cfg["device"], epoch, scaler)
+            
+            # 【新增】计算 Train AUC 
+            try:
+                train_auc = roc_auc_score(t_labels, t_probs) if len(np.unique(t_labels)) > 1 else 0.5
+            except ValueError:
+                train_auc = 0.5
+                
+            # 调用验证
             val_loss, val_auc, val_acc = validate(model, val_loader, criterion, cfg["device"])
             
             scheduler.step()
@@ -192,9 +202,14 @@ def main():
                 torch.save(model.state_dict(), f"{cfg['save_dir']}/best_fold{fold+1}.pth")
                 save_msg = " [*] Best Saved"
             
-            # 【修改】构建日志信息并记录
-            epoch_msg = (f"Epoch {epoch:02d} | Loss: {train_loss:.4f} | Val AUC: {val_auc:.4f} | "
-                         f"Acc: {val_acc:.4f} | 1/0: {np.sum(t_preds==1)}/{np.sum(t_preds==0)}{save_msg}")
+            # 【修改】将 Train 概率转为二值预测，用于计算1/0分布
+            t_preds_binary = (t_probs > 0.5).astype(int)
+            pred_1_count = np.sum(t_preds_binary == 1)
+            pred_0_count = np.sum(t_preds_binary == 0)
+
+            # 【修改】构建带 Train AUC 的日志信息
+            epoch_msg = (f"Epoch {epoch:02d} | Train Loss: {train_loss:.4f} | Train AUC: {train_auc:.4f} | "
+                         f"Val AUC: {val_auc:.4f} | Acc: {val_acc:.4f} | 1/0: {pred_1_count}/{pred_0_count}{save_msg}")
             log(epoch_msg)
         
         fold_auc_scores.append(best_auc)
