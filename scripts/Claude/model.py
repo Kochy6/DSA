@@ -88,7 +88,7 @@ class AttentionPooling(nn.Module):
         weights : Tensor  (B, T, 1)  — per-frame softmax weights
         """
         weights = self.attention(x)              # (B, T, 1)
-        weights = torch.softmax(weights, dim=1)  # normalize over T
+        weights = torch.softmax(weights, dim=1)  # normalize over T 
         output  = torch.sum(x * weights, dim=1)  # (B, D)
         return output, weights
 
@@ -117,13 +117,16 @@ class ResidualBlock1D(nn.Module):
     dropout     : float Dropout probability applied between the two convolutions.
     """
 
-    def __init__(self, channels: int, kernel_size: int = 3, dropout: float = 0.3):
+    def __init__(self, channels: int, kernel_size: int = 3, dropout: float = 0.3, dilation: int = 1):
         super().__init__()
-        padding = kernel_size // 2  # 'same' padding: output T == input T
+        # 【关键修改】动态计算 padding。当 dilation>1 时，卷积核由于膨胀会变宽，
+        # 为了保证输出长度不变，padding 必须随之等比例增大。
+        padding = dilation * (kernel_size - 1) // 2 
 
-        self.conv1 = nn.Conv1d(channels, channels, kernel_size, padding=padding)
+        # 将 dilation 参数传给 Conv1d
+        self.conv1 = nn.Conv1d(channels, channels, kernel_size, padding=padding, dilation=dilation)
         self.bn1   = nn.BatchNorm1d(channels)
-        self.conv2 = nn.Conv1d(channels, channels, kernel_size, padding=padding)
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size, padding=padding, dilation=dilation)
         self.bn2   = nn.BatchNorm1d(channels)
         self.drop  = nn.Dropout(dropout)
         self.relu  = nn.ReLU(inplace=True)
@@ -138,7 +141,7 @@ class ResidualBlock1D(nn.Module):
         -------
         Tensor  (B, channels, T)
         """
-        residual = x
+        residual = x # Save input for skip connection
         out = self.relu(self.bn1(self.conv1(x)))  # first sub-layer
         out = self.drop(out)
         out = self.bn2(self.conv2(out))            # second sub-layer (no ReLU yet)
@@ -178,10 +181,20 @@ class TemporalConvNet(nn.Module):
         dropout: float = 0.3,
     ):
         super().__init__()
-        self.blocks = nn.Sequential(
-            *[ResidualBlock1D(d_model, kernel_size, dropout)
-              for _ in range(num_blocks)]
-        )
+
+        blocks_list = []
+        for i in range(num_blocks):
+            # 【关键修改】每一层的 dilation 呈指数级增长： 1, 2, 4, 8...
+            # 这里 num_blocks 默认是 2，所以分别是 2^0=1 (看附近3帧), 2^1=2 (看附近跨度为5的帧)
+            current_dilation = 2 ** i 
+            blocks_list.append(
+                ResidualBlock1D(channels=d_model, 
+                                kernel_size=kernel_size, 
+                                dropout=dropout, 
+                                dilation=current_dilation)
+            )
+            
+        self.blocks = nn.Sequential(*blocks_list)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -232,7 +245,7 @@ class DSATemporalModel(nn.Module):
 
     def __init__(
         self,
-        num_classes: int = 2,
+        num_classes: int = 2,      # output classes
         d_model: int = 256,        # [FIX-C] reduced from 512
         num_blocks: int = 2,       # [FIX-C] temporal CNN depth
         kernel_size: int = 3,      # [FIX-C] temporal receptive field per block
@@ -247,12 +260,27 @@ class DSATemporalModel(nn.Module):
         #    conv1 replaced for 1-channel DICOM input.
         #    Final FC stripped; output is 512-d global average pool.
         # ------------------------------------------------------------------
-        resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        resnet.conv1 = nn.Conv2d(
-            1, 64, kernel_size=7, stride=2, padding=3, bias=False
-        )
-        self.backbone = nn.Sequential(*(list(resnet.children())[:-1]))
+        # Version 1: torchvision.models.resnet18 (pre-trained)
+        # resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        # resnet.conv1 = nn.Conv2d(
+        #     1, 64, kernel_size=7, stride=2, padding=3, bias=False
+        # )
+        # self.backbone = nn.Sequential(*(list(resnet.children())[:-1]))
         # Output: (B*T, 512, 1, 1)
+
+        # Version 2: Load pre-trained ResNet-18 and adapt conv1 for 1-channel input while
+        resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        # 获取原本 3 通道的权重 (64, 3, 7, 7)
+        pretrained_weight = resnet.conv1.weight.clone() 
+
+        # 创建 1 通道的新卷积
+        resnet.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+
+        # 将 3 个通道的权重相加 (或取平均) 赋给新卷积，保留预训练的边缘提取能力
+        with torch.no_grad():
+            resnet.conv1.weight = nn.Parameter(pretrained_weight.sum(dim=1, keepdim=True))
+
+        self.backbone = nn.Sequential(*(list(resnet.children())[:-1]))
 
         # ------------------------------------------------------------------
         # 2. Feature projection: 512 → d_model
@@ -311,15 +339,33 @@ class DSATemporalModel(nn.Module):
         features = self.backbone(x)            # (B*T, 512, 1, 1)
         features = features.view(b, t, -1)    # (B, T, 512)
 
-        # 2. Project 512 → d_model and normalize
-        x = self.feature_projection(features) # (B, T, d_model)
+        # V1: 直接投影后送入 Transformer
+        # # 2. Project 512 → d_model and normalize
+        # x = self.feature_projection(features) # (B, T, d_model)
+        # x = self.feature_norm(x)
+
+        # # 3. [FIX-C] Temporal refinement via residual Conv1d
+        # x = self.temporal(x)                  # (B, T, d_model)
+
+        # # 4. Attention-weighted temporal aggregation
+        # x, _ = self.att_pooling(x)            # (B, d_model)
+
+        # # 5. Classification
+        # return self.classifier(x)             # (B, num_classes)
+
+        # V2: 【新增】旁路 + 主干并行：空间特征直接平均 + 传统投影+时间网络
+        # 【新增】旁路：直接将空间特征进行无脑平均 (B, 512)
+        spatial_global = features.mean(dim=1) 
+        
+        # 主干：继续原有的投影和时间网络处理
+        x = self.feature_projection(features)
         x = self.feature_norm(x)
-
-        # 3. [FIX-C] Temporal refinement via residual Conv1d
-        x = self.temporal(x)                  # (B, T, d_model)
-
-        # 4. Attention-weighted temporal aggregation
-        x, _ = self.att_pooling(x)            # (B, d_model)
-
-        # 5. Classification
-        return self.classifier(x)             # (B, num_classes)
+        x = self.temporal(x)
+        x_temporal, _ = self.att_pooling(x)   # (B, 256)
+        
+        # 【新增】将 静态特征 与 动态特征 拼接
+        # 此时 x_combined 维度为 512 + 256 = 768
+        x_combined = torch.cat([spatial_global, x_temporal], dim=1) 
+        
+        # 最后送入能接收 768 维度的 classifier
+        return self.classifier(x_combined)

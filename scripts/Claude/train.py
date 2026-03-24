@@ -54,6 +54,7 @@ New fix applied:
 
 import os
 import random
+from datetime import datetime
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -99,7 +100,8 @@ cfg = {
     "num_folds":           5,
     "target_t":            32,       # temporal frames; shared with dataset & model
     "device":              torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-    "save_dir":            "./checkpoints",
+    # 动态生成 save_dir：基础路径 + 时间戳
+    "save_dir":            f"./checkpoints/run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",  # directory to save best models
 }
 
 
@@ -120,11 +122,30 @@ def seed_everything(seed: int = 42):
 # ---------------------------------------------------------------------------
 # 3. [FIX-1] Augmentation wrapper
 # ---------------------------------------------------------------------------
+class RandomGaussianNoise(torch.nn.Module):
+    """自定义的高斯噪声注入模块，模拟 X 射线硬件的本底噪声"""
+    def __init__(self, mean=0., std=0.02, p=0.5):
+        super().__init__()
+        self.mean = mean
+        self.std = std
+        self.p = p
+
+    def forward(self, img):
+        if torch.rand(1).item() < self.p:
+            noise = torch.randn_like(img) * self.std + self.mean
+            return img + noise
+        return img
+
 _TRAIN_TRANSFORM = v2.Compose(
     [
-        v2.RandomAffine(degrees=5, translate=(0.02, 0.02), fill=0),
+        # 微调空间仿射：不翻转！仅模拟患者体位的一点点摆偏，或者C臂机的微小缩放
+        v2.RandomAffine(degrees=5, translate=(0.02, 0.02), scale=(0.95, 1.05), fill=0),
+        # 光度学抖动：模拟 X 线曝光剂量和造影剂浓度的差异
         v2.ColorJitter(brightness=0.1, contrast=0.1),
-        v2.RandomVerticalFlip(p=0.3),
+        # 高斯噪声注入：模拟探测器的电子噪声/量子斑点
+        RandomGaussianNoise(std=0.02, p=0.3),
+        # 随机小面积遮罩：挖掉 1%~5% 的小区域，防过拟合
+        v2.RandomErasing(p=0.2, scale=(0.01, 0.05), ratio=(0.5, 2.0), value=0)
     ]
 )
 
@@ -156,16 +177,17 @@ class AugmentedSubset(torch.utils.data.Dataset):
 # 4. Training logic (one epoch)
 # ---------------------------------------------------------------------------
 def train_one_epoch(model, loader, optimizer, criterion, device, epoch, scaler):
-    model.train()
-    running_loss   = 0.0
-    total_probs    = []
-    total_labels   = []
+    model.train() # 训练模式启用 Dropout 和 BatchNorm 更新
+    running_loss   = 0.0 # 累积损失，用于计算 epoch 平均损失
+    total_probs    = [] # 累积预测概率，用于 epoch 结束时计算 AUC
+    total_labels   = [] # 累积真实标签，与 total_probs 对齐
 
-    os.makedirs("debug_images", exist_ok=True)
-    optimizer.zero_grad()
+    os.makedirs("debug_images", exist_ok=True) # 存储调试图像的目录
+    optimizer.zero_grad() # [FIX-4] zero_grad at epoch start; step() will zero_grad after every update
     last_step_batch_idx = -1  # [FIX-4] track last optimizer step
 
-    for batch_idx, (images, labels) in enumerate(loader):
+    for batch_idx, (images, labels) in enumerate(loader): # 遍历 DataLoader 的每个 batch
+        # ----- [FIX-10] Debug: save mid-frame of first batch each epoch ----
 
         # Debug: save mid-frame of first batch each epoch for visual sanity check
         if batch_idx == 0:
@@ -190,16 +212,16 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch, scaler):
 
         scaler.scale(loss).backward()
 
-        if (batch_idx + 1) % cfg["accumulation_steps"] == 0:
+        if (batch_idx + 1) % cfg["accumulation_steps"] == 0: # 每 accumulation_steps 个 batch 更新一次
             # [FIX-10] Unscale first so clip_grad_norm operates on true grads
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["max_grad_norm"])
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-            last_step_batch_idx = batch_idx  # [FIX-4]
+            scaler.unscale_(optimizer) # 取消缩放，恢复原始梯度值，以便正确应用梯度裁剪
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["max_grad_norm"]) # 梯度裁剪，防止爆炸
+            scaler.step(optimizer) # 更新参数
+            scaler.update() # 更新 scaler 状态
+            optimizer.zero_grad() # 清零梯度，为下一轮累积准备
+            last_step_batch_idx = batch_idx  # [FIX-4] 记录最后一次更新的 batch 索引
 
-        running_loss += loss.item() * cfg["accumulation_steps"] * images.size(0)
+        running_loss += loss.item() * cfg["accumulation_steps"] * images.size(0) # 累积损失，乘回 accumulation_steps 和 batch 大小以得到正确的总损失
 
         with torch.no_grad():
             probs = torch.softmax(outputs, dim=1)[:, 1]
@@ -302,11 +324,15 @@ def main():
 
         train_loader = DataLoader(
             train_subset, batch_size=cfg["batch_size"], shuffle=True,
-            num_workers=4, pin_memory=True, persistent_workers=True,
+            # Windows(开发)使用0线程防内存暴跌，Linux(训练)使用4线程并开启持久化
+            num_workers=0 if os.name == 'nt' else 4, 
+            pin_memory=True, 
+            persistent_workers=False if os.name == 'nt' else True,
         )
         val_loader = DataLoader(
             val_subset, batch_size=cfg["batch_size"], shuffle=False,
-            num_workers=2, pin_memory=True,
+            num_workers=0 if os.name == 'nt' else 2, 
+            pin_memory=True,
         )
 
         # [FIX-3] seq_len passed from cfg so positional structures match target_t
@@ -362,13 +388,24 @@ def main():
             # avoids resetting the ReduceLROnPlateau plateau counter.
             # -------------------------------------------------------------
             if epoch == cfg["freeze_epochs"]:
-                model.backbone.requires_grad_(True)
+                # [阶梯式解冻优化] 仅解冻 ResNet 的高级层 (layer3, layer4)
+                # 保持底层 (conv1, layer1, layer2) 永远冻结，防止医疗小样本破坏底层普适特征
+                backbone_children = list(model.backbone.children())
+                layer3 = backbone_children[6]
+                layer4 = backbone_children[7]
+                
+                for param in layer3.parameters():
+                    param.requires_grad = True
+                for param in layer4.parameters():
+                    param.requires_grad = True
+                    
                 torch.cuda.empty_cache()
 
                 backbone_lr = cfg["lr"] * cfg["backbone_lr_frac"]
+                # 仅将解冻的 layer3 和 layer4 的参数传给优化器
                 optimizer.add_param_group(
                     {
-                        "params":       model.backbone.parameters(),
+                        "params":       list(layer3.parameters()) + list(layer4.parameters()),
                         "lr":           backbone_lr,
                         # [FIX-A2] High weight decay prevents backbone from
                         # straying far from its ImageNet initialization
@@ -376,9 +413,9 @@ def main():
                     }
                 )
                 log(
-                    f"[INFO] Epoch {epoch}: Backbone unfrozen — "
+                    f"[INFO] Epoch {epoch}: Backbone阶梯式解冻 (仅Layer3 & Layer4) — "
                     f"lr={backbone_lr:.2e}, wd={cfg['backbone_weight_decay']} "
-                    f"[FIX-A1/A2]"
+                    f"[阶梯解冻优化]"
                 )
 
             # ----- Train one epoch ----------------------------------------
