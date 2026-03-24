@@ -11,8 +11,8 @@ import numpy as np
 import os
 import random
 
-from dataset import DSADataset
-from model import DSATemporalModel
+from scripts.core.dataset import DSADataset
+from scripts.core.model import DSATemporalModel
 
 # --- 1. 超参数与全局配置 ---
 cfg = {

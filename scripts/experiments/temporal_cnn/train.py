@@ -68,8 +68,8 @@ from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, Subset
 import torchvision.transforms.v2 as v2
 
-from dataset import DSADataset
-from model import DSATemporalModel
+from scripts.experiments.temporal_cnn.dataset import DSADataset
+from scripts.experiments.temporal_cnn.model import DSATemporalModel
 
 
 # ---------------------------------------------------------------------------

@@ -36,3 +36,8 @@ DSA sequence prognostic prediction
 ```bash
 pip install torch torchvision torchaudio
 pip install monai pydicom pandas scikit-learn
+
+```
+
+## 📂 5. 项目结构
+详见 `PROJECT_STRUCTURE.md`。
