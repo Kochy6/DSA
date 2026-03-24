@@ -1,4 +1,4 @@
-from dataset import DSADataset
+from scripts.core.dataset import DSADataset
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 
