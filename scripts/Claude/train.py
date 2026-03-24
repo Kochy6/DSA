@@ -76,18 +76,18 @@ from model import DSATemporalModel
 # 1. Hyper-parameters and global configuration
 # ---------------------------------------------------------------------------
 cfg = {
-    "csv_path":            r"/mnt/pro/DSA/cleansed_list.csv",
-    "batch_size":          4,        # Physical VRAM limit
-    "accumulation_steps":  8,        # Effective batch size = 4 × 8 = 32
+    "csv_path":            r"/root/autodl-tmp/DSA/cleansed_list.csv",
+    "batch_size":          32,       # [FIX: 满血利用 RTX 5090]
+    "accumulation_steps":  1,        # 真实batch=32，无需再进行累加
     "epochs":              60,       # Increased headroom; early stopping will
                                      # terminate most folds well before epoch 60
     # --- [FIX-A1] Delayed unfreeze ---
-    "freeze_epochs":       25,       # was 10; head trains for 25 epochs first
+    "freeze_epochs":       40,       # was 10; head trains for 25 epochs first
     # --- Learning rates ---
     "lr":                  5e-5,     # head LR (all epochs)
     "backbone_lr_frac":    0.1,      # backbone LR = lr * backbone_lr_frac
     # --- [FIX-A2] Regularization ---
-    "head_weight_decay":   0.1,      # was 0.05; stronger head regularization
+    "head_weight_decay":   0.5,      # was 0.05; stronger head regularization
     "backbone_weight_decay": 0.2,    # was 0.05; strong backbone regularization
     # --- [FIX-A3] ReduceLROnPlateau ---
     "lr_factor":           0.5,      # LR multiplied by this on plateau
@@ -324,13 +324,14 @@ def main():
 
         train_loader = DataLoader(
             train_subset, batch_size=cfg["batch_size"], shuffle=True,
-            # Windows(开发)使用0线程防内存暴跌，Linux(训练)使用4线程并开启持久化
-            num_workers=0 if os.name == 'nt' else 4, 
+            # Windows(开发)使用0，Linux(训练)使用12线程拉满数据供给喂饱显卡
+            num_workers=0 if os.name == 'nt' else 8, 
             pin_memory=True, 
             persistent_workers=False if os.name == 'nt' else True,
         )
         val_loader = DataLoader(
             val_subset, batch_size=cfg["batch_size"], shuffle=False,
+            # 验证集也相应提速
             num_workers=0 if os.name == 'nt' else 2, 
             pin_memory=True,
         )

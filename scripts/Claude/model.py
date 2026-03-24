@@ -312,14 +312,14 @@ class DSATemporalModel(nn.Module):
 
         # ------------------------------------------------------------------
         # 5. Classifier
-        #    Hidden dim halved (d_model//2 = 128) relative to old 256 head.
+        #    Hidden dim adjusted for V2 combined bypass (512 + 256 = 768)
         #    Dropout(0.5) before output layer for regularization.
         # ------------------------------------------------------------------
         self.classifier = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
+            nn.Linear(512 + d_model, d_model),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(d_model // 2, num_classes),
+            nn.Linear(d_model, num_classes),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -339,7 +339,7 @@ class DSATemporalModel(nn.Module):
         features = self.backbone(x)            # (B*T, 512, 1, 1)
         features = features.view(b, t, -1)    # (B, T, 512)
 
-        # V1: 直接投影后送入 Transformer
+        # V1: 直接投影后送入 Transformer (或旧版1D CNN) --------
         # # 2. Project 512 → d_model and normalize
         # x = self.feature_projection(features) # (B, T, d_model)
         # x = self.feature_norm(x)
@@ -352,20 +352,24 @@ class DSATemporalModel(nn.Module):
 
         # # 5. Classification
         # return self.classifier(x)             # (B, num_classes)
+        # -------------------------------------------------------------
 
-        # V2: 【新增】旁路 + 主干并行：空间特征直接平均 + 传统投影+时间网络
-        # 【新增】旁路：直接将空间特征进行无脑平均 (B, 512)
-        spatial_global = features.mean(dim=1) 
+        # V2: 【新增】旁路 + 主干并行：空间特征直接平均 + 传统投影+时间网络 -----------------
+        # 1. 旁路：空间特征直接执行全局平均池化
+        spatial_global = features.mean(dim=1)  # (B, 512)
         
-        # 主干：继续原有的投影和时间网络处理
-        x = self.feature_projection(features)
+        # 2. 主干：投影 -> 时间卷积 -> Attention Pooling
+        x = self.feature_projection(features)  # (B, T, d_model)
         x = self.feature_norm(x)
-        x = self.temporal(x)
-        x_temporal, _ = self.att_pooling(x)   # (B, 256)
+        x = self.temporal(x)                   # (B, T, d_model)
         
-        # 【新增】将 静态特征 与 动态特征 拼接
-        # 此时 x_combined 维度为 512 + 256 = 768
-        x_combined = torch.cat([spatial_global, x_temporal], dim=1) 
+        # 为了防止时间特征过于跳脱，增加一点残差补充 (原特征的均值)
+        # 保证 x_temporal 即便时间模块学崩了，也有托底的基准线
+        x_base = x.mean(dim=1)                 # (B, d_model)
+        x_att, _ = self.att_pooling(x)         # (B, d_model)
+        x_temporal = x_base + x_att            # (B, 256) (残差相加防崩塌)
         
-        # 最后送入能接收 768 维度的 classifier
+        # 3. 将 静态特征 与 动态结合特征 拼接
+        x_combined = torch.cat([spatial_global, x_temporal], dim=1) # (B, 768)
+        
         return self.classifier(x_combined)

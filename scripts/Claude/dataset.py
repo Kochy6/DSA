@@ -89,7 +89,7 @@ class DSADataset(Dataset):
     """
 
     _FALLBACK_ROOTS = [
-        "/mnt/pro/DSA/data/ori_data/DICOM1",
+        "/root/autodl-tmp/DSA/data/ori_data/DICOM1",
         "/autodl-fs/data/Pro/DSA/dicom_all",
     ]
 
